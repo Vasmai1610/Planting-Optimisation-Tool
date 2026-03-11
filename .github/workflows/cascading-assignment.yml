@@ -1,4 +1,4 @@
-name: Cascade Assignment to Sub-Issues
+name: Cascade Assignment and Status to Sub-Issues
 
 on:
   issues:
@@ -8,20 +8,21 @@ permissions:
   issues: write
 
 jobs:
-  assign-sub-issues:
+  cascade-to-sub-issues:
     runs-on: ubuntu-latest
     steps:
-      - name: Cascade assignment/unassignment to sub-issues
+      - name: Cascade assignment and board status to sub-issues
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.BOARD_STATUS_CHANGER }}
           ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
           ASSIGNEE: ${{ github.event.assignee.login }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
           EVENT_ACTION: ${{ github.event.action }}
+          PROJECT_NUMBER: 3
         run: |
-          # Fetch sub-issues via GraphQL
+          # ── 1. Fetch sub-issues ───────────────────────────────────────────
           SUB_ISSUES=$(gh api graphql \
             -H "GraphQL-Features: sub_issues" \
             -f query='
@@ -29,36 +30,119 @@ jobs:
                 node(id: $id) {
                   ... on Issue {
                     subIssues(first: 50) {
-                      nodes {
-                        number
-                      }
+                      nodes { number nodeId: id }
                     }
                   }
                 }
               }
             ' \
             -f id="$ISSUE_NODE_ID" \
-            --jq '.data.node.subIssues.nodes[].number')
+            --jq '.data.node.subIssues.nodes')
 
-          if [ -z "$SUB_ISSUES" ]; then
+          if [ "$SUB_ISSUES" = "[]" ] || [ -z "$SUB_ISSUES" ]; then
             echo "No sub-issues found for issue #$ISSUE_NUMBER"
             exit 0
           fi
 
-          echo "Found sub-issues: $SUB_ISSUES"
+          # ── 2. Fetch project ID, Status field ID, and option IDs ──────────
+          PROJECT_DATA=$(gh api graphql -f query='
+            query($owner: String!, $number: Int!) {
+              user(login: $owner) {
+                projectV2(number: $number) {
+                  id
+                  fields(first: 20) {
+                    nodes {
+                      ... on ProjectV2SingleSelectField {
+                        id name
+                        options { id name }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f owner="$REPO_OWNER" -F number="$PROJECT_NUMBER" 2>/dev/null || \
+          gh api graphql -f query='
+            query($owner: String!, $number: Int!) {
+              organization(login: $owner) {
+                projectV2(number: $number) {
+                  id
+                  fields(first: 20) {
+                    nodes {
+                      ... on ProjectV2SingleSelectField {
+                        id name
+                        options { id name }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f owner="$REPO_OWNER" -F number="$PROJECT_NUMBER")
 
-          for SUB_ISSUE_NUMBER in $SUB_ISSUES; do
+          PROJECT_ID=$(echo "$PROJECT_DATA" | jq -r '.. | .projectV2?.id? | select(.)')
+          STATUS_FIELD_ID=$(echo "$PROJECT_DATA" | jq -r '.. | .fields?.nodes[]? | select(.name=="Status") | .id')
+          SPRINT_BACKLOG_ID=$(echo "$PROJECT_DATA" | jq -r '.. | .fields?.nodes[]? | select(.name=="Status") | .options[]? | select(.name=="Sprint Backlog") | .id')
+          IN_PROGRESS_ID=$(echo "$PROJECT_DATA" | jq -r '.. | .fields?.nodes[]? | select(.name=="Status") | .options[]? | select(.name=="In progress") | .id')
+
+          echo "Project: $PROJECT_ID | Status field: $STATUS_FIELD_ID"
+          echo "Sprint Backlog: $SPRINT_BACKLOG_ID | In Progress: $IN_PROGRESS_ID"
+
+          # ── 3. Determine target status ────────────────────────────────────
+          if [ "$EVENT_ACTION" = "assigned" ]; then
+            TARGET_STATUS_ID="$IN_PROGRESS_ID"
+          else
+            TARGET_STATUS_ID="$SPRINT_BACKLOG_ID"
+          fi
+
+          # ── 4. Loop through sub-issues ────────────────────────────────────
+          echo "$SUB_ISSUES" | jq -c '.[]' | while read -r sub; do
+            SUB_NUMBER=$(echo "$sub" | jq -r '.number')
+            SUB_NODE_ID=$(echo "$sub" | jq -r '.nodeId')
+
+            # Assign or unassign
             if [ "$EVENT_ACTION" = "assigned" ]; then
-              echo "Assigning sub-issue #$SUB_ISSUE_NUMBER to $ASSIGNEE"
-              gh api \
-                --method POST \
-                repos/$REPO_OWNER/$REPO_NAME/issues/$SUB_ISSUE_NUMBER/assignees \
+              echo "Assigning #$SUB_NUMBER to $ASSIGNEE"
+              gh api --method POST \
+                repos/$REPO_OWNER/$REPO_NAME/issues/$SUB_NUMBER/assignees \
                 -f "assignees[]=$ASSIGNEE"
-            elif [ "$EVENT_ACTION" = "unassigned" ]; then
-              echo "Unassigning $ASSIGNEE from sub-issue #$SUB_ISSUE_NUMBER"
-              gh api \
-                --method DELETE \
-                repos/$REPO_OWNER/$REPO_NAME/issues/$SUB_ISSUE_NUMBER/assignees \
+            else
+              echo "Unassigning $ASSIGNEE from #$SUB_NUMBER"
+              gh api --method DELETE \
+                repos/$REPO_OWNER/$REPO_NAME/issues/$SUB_NUMBER/assignees \
                 -f "assignees[]=$ASSIGNEE"
+            fi
+
+            # Update project board status
+            if [ -n "$PROJECT_ID" ] && [ -n "$STATUS_FIELD_ID" ] && [ -n "$TARGET_STATUS_ID" ]; then
+              ITEM_ID=$(gh api graphql -f query='
+                query($id: ID!) {
+                  node(id: $id) {
+                    ... on Issue {
+                      projectItems(first: 5) {
+                        nodes { id project { id } }
+                      }
+                    }
+                  }
+                }' -f id="$SUB_NODE_ID" \
+                --jq --arg pid "$PROJECT_ID" \
+                '.data.node.projectItems.nodes[] | select(.project.id==$pid) | .id')
+
+              if [ -n "$ITEM_ID" ]; then
+                echo "Setting #$SUB_NUMBER status on board"
+                gh api graphql -f query='
+                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $projectId
+                      itemId: $itemId
+                      fieldId: $fieldId
+                      value: { singleSelectOptionId: $optionId }
+                    }) { projectV2Item { id } }
+                  }' \
+                  -f projectId="$PROJECT_ID" \
+                  -f itemId="$ITEM_ID" \
+                  -f fieldId="$STATUS_FIELD_ID" \
+                  -f optionId="$TARGET_STATUS_ID"
+              else
+                echo "Sub-issue #$SUB_NUMBER not found in project board, skipping status update"
+              fi
             fi
           done
