@@ -22,33 +22,7 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           PROJECT_NUMBER: 3
         run: |
-          # ── 1. Fetch sub-issues ───────────────────────────────────────────
-          echo "🔍 Fetching sub-issues..."
-          SUB_ISSUES=$(gh api graphql \
-            -H "GraphQL-Features: sub_issues" \
-            -f query='
-              query($id: ID!) {
-                node(id: $id) {
-                  ... on Issue {
-                    subIssues(first: 50) {
-                      nodes { 
-                        number 
-                        nodeId: id 
-                      }
-                    }
-                  }
-                }
-              }
-            ' \
-            -f id="$ISSUE_NODE_ID" \
-            --jq '.data.node.subIssues.nodes')
-
-          if [ "$SUB_ISSUES" = "[]" ] || [ -z "$SUB_ISSUES" ] || [ "$SUB_ISSUES" = "null" ]; then
-            echo "ℹ️ No sub-issues found for issue #$ISSUE_NUMBER"
-            exit 0
-          fi
-
-          # ── 2. Fetch project ID, Status field ID, and option IDs ──────────
+          # ── 1. Fetch project ID, Status field ID, and option IDs ──────────
           echo "📊 Fetching project data..."
           PROJECT_DATA=$(gh api graphql -f query='
             query($owner: String!, $number: Int!) {
@@ -101,7 +75,7 @@ jobs:
           echo "✅ Sprint Backlog ID: $SPRINT_BACKLOG_ID"
           echo "✅ In Progress ID: $IN_PROGRESS_ID"
 
-          # ── 3. Determine target status ────────────────────────────────────
+          # ── 2. Determine target status ────────────────────────────────────
           if [ "$EVENT_ACTION" = "assigned" ]; then
             TARGET_STATUS_ID="$IN_PROGRESS_ID"
             TARGET_STATUS_NAME="In Progress"
@@ -112,15 +86,16 @@ jobs:
 
           echo "🎯 Target status: $TARGET_STATUS_NAME ($TARGET_STATUS_ID)"
 
-          # ── 4. Update parent issue status ─────────────────────────────────
+          # ── 3. Update parent issue status ─────────────────────────────────
           if [ -n "$PROJECT_ID" ] && [ -n "$STATUS_FIELD_ID" ] && [ -n "$TARGET_STATUS_ID" ]; then
             echo "📝 Updating parent issue #$ISSUE_NUMBER status to $TARGET_STATUS_NAME..."
             
-            PARENT_ITEM_ID=$(gh api graphql -f query='
+            # Get the project item ID for the parent issue
+            PARENT_QUERY=$(gh api graphql -f query='
               query($id: ID!) {
                 node(id: $id) {
                   ... on Issue {
-                    projectItems(first: 10) {
+                    projectItems(first: 20) {
                       nodes { 
                         id
                         project {
@@ -130,32 +105,74 @@ jobs:
                     }
                   }
                 }
-              }' -f id="$ISSUE_NODE_ID" \
-              --jq --arg pid "$PROJECT_ID" \
-              '.data.node.projectItems.nodes[] | select(.project.id==$pid) | .id' 2>/dev/null || echo "")
+              }' -f id="$ISSUE_NODE_ID" 2>&1)
+            
+            if [ $? -ne 0 ]; then
+              echo "  ❌ Failed to query parent project items:"
+              echo "$PARENT_QUERY"
+            else
+              # Extract the item ID
+              PARENT_ITEM_ID=$(echo "$PARENT_QUERY" | jq -r --arg pid "$PROJECT_ID" '.data.node.projectItems.nodes[] | select(.project.id==$pid) | .id' 2>/dev/null || echo "")
+              
+              if [ -n "$PARENT_ITEM_ID" ] && [ "$PARENT_ITEM_ID" != "null" ]; then
+                echo "  ✅ Found parent project item: $PARENT_ITEM_ID"
+                
+                PARENT_UPDATE=$(gh api graphql -f query='
+                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $projectId
+                      itemId: $itemId
+                      fieldId: $fieldId
+                      value: { singleSelectOptionId: $optionId }
+                    }) {
+                      projectV2Item {
+                        id
+                      }
+                    }
+                  }' \
+                  -f projectId="$PROJECT_ID" \
+                  -f itemId="$PARENT_ITEM_ID" \
+                  -f fieldId="$STATUS_FIELD_ID" \
+                  -f optionId="$TARGET_STATUS_ID" 2>&1)
+                
+                if [ $? -eq 0 ]; then
+                  echo "  ✅ Parent issue status updated to $TARGET_STATUS_NAME"
+                else
+                  echo "  ❌ Failed to update parent issue status"
+                  echo "  Error: $PARENT_UPDATE"
+                fi
+              else
+                echo "  ⚠️ Parent issue not found in project board"
+                echo "  Debug: Available projects for parent issue:"
+                echo "$PARENT_QUERY" | jq -r '.data.node.projectItems.nodes[] | "    - Project: \(.project.id)"' 2>/dev/null || echo "    No projects found"
+              fi
+            fi
+          fi
 
-            if [ -n "$PARENT_ITEM_ID" ] && [ "$PARENT_ITEM_ID" != "null" ]; then
-              echo "  Found parent project item: $PARENT_ITEM_ID"
-              gh api graphql -f query='
-                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-                  updateProjectV2ItemFieldValue(input: {
-                    projectId: $projectId
-                    itemId: $itemId
-                    fieldId: $fieldId
-                    value: { singleSelectOptionId: $optionId }
-                  }) {
-                    projectV2Item {
-                      id
+          # ── 4. Fetch sub-issues ───────────────────────────────────────────
+          echo "🔍 Fetching sub-issues..."
+          SUB_ISSUES=$(gh api graphql \
+            -H "GraphQL-Features: sub_issues" \
+            -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on Issue {
+                    subIssues(first: 50) {
+                      nodes { 
+                        number 
+                        nodeId: id 
+                      }
                     }
                   }
-                }' \
-                -f projectId="$PROJECT_ID" \
-                -f itemId="$PARENT_ITEM_ID" \
-                -f fieldId="$STATUS_FIELD_ID" \
-                -f optionId="$TARGET_STATUS_ID" && echo "  ✅ Parent issue status updated" || echo "  ❌ Failed to update parent issue status"
-            else
-              echo "  ⚠️ Parent issue not found in project board, skipping status update"
-            fi
+                }
+              }
+            ' \
+            -f id="$ISSUE_NODE_ID" \
+            --jq '.data.node.subIssues.nodes' 2>/dev/null)
+
+          if [ "$SUB_ISSUES" = "[]" ] || [ -z "$SUB_ISSUES" ] || [ "$SUB_ISSUES" = "null" ]; then
+            echo "ℹ️ No sub-issues found for issue #$ISSUE_NUMBER"
+            exit 0
           fi
 
           # ── 5. Store sub-issues in array ──────────────────────────────────
@@ -199,8 +216,8 @@ jobs:
             if [ -n "$PROJECT_ID" ] && [ -n "$STATUS_FIELD_ID" ] && [ -n "$TARGET_STATUS_ID" ]; then
               echo "  🔍 Looking for sub-issue #$SUB_NUMBER in project board..."
               
-              # Get the project item ID - FIXED: removed projectId variable from query
-              PROJECT_ITEMS_QUERY=$(gh api graphql -f query='
+              # Get the project item ID
+              SUB_QUERY=$(gh api graphql -f query='
                 query($id: ID!) {
                   node(id: $id) {
                     ... on Issue {
@@ -219,12 +236,12 @@ jobs:
               # Check if the query succeeded
               if [ $? -ne 0 ]; then
                 echo "  ❌ Failed to query project items:"
-                echo "$PROJECT_ITEMS_QUERY"
+                echo "$SUB_QUERY"
                 continue
               fi
               
               # Extract the item ID
-              ITEM_ID=$(echo "$PROJECT_ITEMS_QUERY" | jq -r --arg pid "$PROJECT_ID" '.data.node.projectItems.nodes[] | select(.project.id==$pid) | .id' 2>/dev/null || echo "")
+              ITEM_ID=$(echo "$SUB_QUERY" | jq -r --arg pid "$PROJECT_ID" '.data.node.projectItems.nodes[] | select(.project.id==$pid) | .id' 2>/dev/null || echo "")
 
               if [ -n "$ITEM_ID" ] && [ "$ITEM_ID" != "null" ]; then
                 echo "  ✅ Found project item: $ITEM_ID for #$SUB_NUMBER"
@@ -257,7 +274,7 @@ jobs:
               else
                 echo "  ⚠️ Sub-issue #$SUB_NUMBER not found in project board"
                 echo "  Debug: Available projects for this issue:"
-                echo "$PROJECT_ITEMS_QUERY" | jq -r '.data.node.projectItems.nodes[] | "    - Project: \(.project.id)"' 2>/dev/null || echo "    No projects found"
+                echo "$SUB_QUERY" | jq -r '.data.node.projectItems.nodes[] | "    - Project: \(.project.id)"' 2>/dev/null || echo "    No projects found"
               fi
             fi
           done
